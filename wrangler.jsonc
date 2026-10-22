@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nexus-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // Secrets (never in this file):
+  //   wrangler secret put NEXUS_API_KEY
+  //   wrangler secret put PATH_TOKEN
+}
