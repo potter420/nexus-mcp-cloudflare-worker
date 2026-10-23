@@ -5,7 +5,23 @@
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+
+  // No side doors: the custom domain (behind Cloudflare Access) is the only route.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "nexus-mcp-worker.lakehaus.ai", "custom_domain": true }],
+
+  "vars": {
+    // Must match routes[0].pattern.
+    "MCP_HOSTNAME": "nexus-mcp-worker.lakehaus.ai",
+    // Access JWT issuer; certs are fetched from <this>/cdn-cgi/access/certs.
+    "ACCESS_TEAM_DOMAIN": "https://lakehausai.cloudflareaccess.com",
+    // AUD tag of the Self-hosted Access app (Zero Trust → Access → Applications → Overview).
+    // Empty = Worker returns 500 to everything until filled in.
+    "ACCESS_AUD": "e71e03b6a6159af9c02aff3a4dc0a9a6f573d9837430983302b784ad34841c17",
+    // Optional comma-separated allowlist, checked against the JWT `email` claim.
+    "ALLOWED_EMAILS": "thanhmt0612@gmail.com"
+  }
   // Secrets (never in this file):
   //   wrangler secret put NEXUS_API_KEY
-  //   wrangler secret put PATH_TOKEN
 }

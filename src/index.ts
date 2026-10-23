@@ -2,17 +2,22 @@
  * nexus-mcp — a read-only Nexus Mods MCP server on Cloudflare Workers.
  *
  * Transport: stateless Streamable HTTP (agents/mcp/server + MCP SDK v2).
- * Auth to this Worker: an unguessable path segment (/mcp/<PATH_TOKEN>).
+ * Auth to this Worker: Cloudflare Access fronts the custom domain; the Worker
+ * independently verifies the Access JWT (Cf-Access-Jwt-Assertion).
  * Auth to Nexus: your personal API key, held as a Worker secret and never
  * returned in any response.
  */
 import { createMcpHandler } from "agents/mcp/server";
 import { McpServer } from "@modelcontextprotocol/server";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
 
 export interface Env {
-  NEXUS_API_KEY: string; // wrangler secret put NEXUS_API_KEY
-  PATH_TOKEN: string; // wrangler secret put PATH_TOKEN  (>= 32 random chars)
+  NEXUS_API_KEY: string; // secret: wrangler secret put NEXUS_API_KEY
+  MCP_HOSTNAME: string; // var: the only Host we answer on
+  ACCESS_TEAM_DOMAIN: string; // var: https://<team>.cloudflareaccess.com (= JWT iss)
+  ACCESS_AUD: string; // var: the Access application's AUD tag
+  ALLOWED_EMAILS?: string; // var: optional comma-separated allowlist
 }
 
 const APP_NAME = "personal-nexus-mcp";
@@ -97,7 +102,8 @@ function bbcodeToText(s: string | undefined | null): string {
 }
 
 function out(value: unknown) {
-  let text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  // Compact JSON: indentation roughly doubles size and burns the MAX_TEXT budget.
+  let text = typeof value === "string" ? value : JSON.stringify(value);
   if (text.length > MAX_TEXT) text = `${text.slice(0, MAX_TEXT)}\n…[truncated at ${MAX_TEXT} chars]`;
   return { content: [{ type: "text" as const, text }] };
 }
@@ -116,6 +122,19 @@ const game = z
   .describe("Nexus game domain, e.g. skyrimspecialedition");
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
+
+/** Domain → numeric game id. Static data, so a per-isolate cache is safe. */
+const gameIds = new Map<string, number>();
+
+async function resolveGameId(env: Env, domainName: string): Promise<number> {
+  const hit = gameIds.get(domainName);
+  if (hit) return hit;
+  const data = await gql(env, `query Game($d: String) { game(domainName: $d) { id } }`, { d: domainName });
+  const id = data.game?.id;
+  if (typeof id !== "number") throw new Error(`Unknown Nexus game domain: ${domainName}`);
+  gameIds.set(domainName, id);
+  return id;
+}
 
 /** Reject anything that is not a query operation. Coarse on purpose. */
 function assertReadOnly(query: string) {
@@ -137,7 +156,7 @@ function buildServer(env: Env, ctx: ExecutionContext): McpServer {
       description:
         "Search a game's mods on Nexus by name (wildcard match). Returns id, name, summary, author, endorsements, downloads, updated time. Use get_mod for full details.",
       inputSchema: z.object({
-        term: z.string().min(1).describe("Words to match in the mod name"),
+        term: z.string().min(2).describe("Words to match in the mod name (substring, case-insensitive; no * needed)"),
         game,
         sort: z.enum(["endorsements", "downloads"]).default("endorsements"),
         count: z.number().int().min(1).max(50).default(20),
@@ -150,7 +169,7 @@ function buildServer(env: Env, ctx: ExecutionContext): McpServer {
       const query = /* GraphQL */ `
         query Search($filter: ModsFilter, $count: Int, $offset: Int) {
           mods(filter: $filter, sort: { ${sort}: { direction: DESC } }, count: $count, offset: $offset) {
-            nodes { modId name summary version uploader { name } endorsements downloads uploadedAt }
+            nodes { modId name summary version uploader { name } endorsements downloads updatedAt }
           }
         }`;
       const filter = {
@@ -211,20 +230,44 @@ function buildServer(env: Env, ctx: ExecutionContext): McpServer {
     {
       title: "Get mod requirements",
       description:
-        "The 'Requirements' list a mod author declared on Nexus (other Nexus mods this one needs). Off-site requirements (e.g. SKSE) may only appear in the description; check get_mod too.",
+        "The 'Requirements' a mod author declared on Nexus: Nexus mods this one needs, off-site requirements (external: true, with url, e.g. VC++ redist), and DLC. Some authors only list requirements in the description; check get_mod too.",
       inputSchema: z.object({ mod_id: z.number().int().positive(), game }),
       annotations: READ_ONLY,
     },
     async ({ mod_id, game }) => {
       const query = /* GraphQL */ `
-        query Req($modId: Int!, $gameDomainName: String!) {
-          modRequirements(modId: $modId, gameDomainName: $gameDomainName) {
-            nexusRequirements { nodes { modId modName } }
+        query Req($modId: ID!, $gameId: ID!) {
+          mod(modId: $modId, gameId: $gameId) {
+            modId name
+            modRequirements {
+              nexusRequirements(count: 50) {
+                totalCount
+                nodes { modId modName externalRequirement notes url }
+              }
+              dlcRequirements { notes gameExpansion { name } }
+            }
           }
         }`;
       try {
-        const data = await gql(env, query, { modId: mod_id, gameDomainName: game });
-        return out(data.modRequirements);
+        const gameId = await resolveGameId(env, game);
+        const data = await gql(env, query, { modId: String(mod_id), gameId: String(gameId) });
+        const r = data.mod.modRequirements;
+        return out({
+          mod_id: data.mod.modId,
+          name: data.mod.name,
+          total: r.nexusRequirements.totalCount,
+          requirements: r.nexusRequirements.nodes.map((n: any) =>
+            n.externalRequirement
+              ? { name: n.modName, external: true, url: n.url, notes: n.notes || undefined }
+              : {
+                  mod_id: Number(n.modId),
+                  name: n.modName,
+                  url: `https://www.nexusmods.com/${game}/mods/${n.modId}`,
+                  notes: n.notes || undefined,
+                },
+          ),
+          dlc: r.dlcRequirements.map((d: any) => ({ name: d.gameExpansion?.name, notes: d.notes || undefined })),
+        });
       } catch (e) {
         return fail(e);
       }
@@ -273,7 +316,7 @@ function buildServer(env: Env, ctx: ExecutionContext): McpServer {
       description:
         "Search curated Nexus Collections (mod lists) for a game by name, most-endorsed first. Useful for seeing what other lists pair with a given mod.",
       inputSchema: z.object({
-        term: z.string().default("").describe("Name filter; empty for top collections"),
+        term: z.string().default("").describe("Name filter (substring, 2+ chars); empty for top collections"),
         game,
         count: z.number().int().min(1).max(50).default(20),
       }),
@@ -281,17 +324,20 @@ function buildServer(env: Env, ctx: ExecutionContext): McpServer {
     },
     async ({ term, game, count }) => {
       const query = /* GraphQL */ `
-        query Cols($game: String!, $term: String, $count: Int) {
-          collections(
-            filter: { gameDomain: { value: $game, op: EQUALS }, name: { value: $term, op: WILDCARD } }
-            sort: { endorsements: { direction: DESC } }
-            count: $count
-          ) { nodes { slug name summary endorsements downloads } }
+        query Cols($filter: CollectionsSearchFilter, $count: Int) {
+          collectionsV2(filter: $filter, sort: [{ endorsements: { direction: DESC } }], count: $count) {
+            nodes { slug name summary endorsements totalDownloads }
+          }
         }`;
+      const t = term.trim();
+      if (t.length === 1) return fail(new Error("term must be empty or at least 2 characters"));
+      // The API rejects WILDCARD values under 2 chars, so omit the name filter when empty.
+      const filter: Record<string, unknown> = { gameDomain: [{ value: game, op: "EQUALS" }] };
+      if (t) filter.name = [{ value: t, op: "WILDCARD" }];
       try {
-        const data = await gql(env, query, { game, term, count });
+        const data = await gql(env, query, { filter, count });
         return out(
-          data.collections.nodes.map((c: any) => ({
+          data.collectionsV2.nodes.map((c: any) => ({
             ...c,
             url: `https://www.nexusmods.com/games/${game}/collections/${c.slug}`,
           })),
@@ -307,7 +353,7 @@ function buildServer(env: Env, ctx: ExecutionContext): McpServer {
     {
       title: "Raw read-only GraphQL",
       description:
-        "Escape hatch: run any read-only query against Nexus's v2 GraphQL API (https://api.nexusmods.com/v2/graphql). The schema is undocumented; introspect with __schema/__type when a typed tool's query fails or a field you need is missing (e.g. collection mod lists, mods that require a given mod). Mutations and subscriptions are rejected.",
+        "Escape hatch: run any read-only query against Nexus's v2 GraphQL API (https://api.nexusmods.com/v2/graphql). The schema is undocumented; introspect when a typed tool's query fails or a field you need is missing. Output is capped at 20k chars, so introspect ONE type per call and keep it small, e.g. `{ __type(name: \"Mod\") { fields { name } } }`; never dump __schema. Root fields take numeric ids: mod(modId: ID!, gameId: ID!); get gameId via game(domainName: \"skyrimspecialedition\") { id } (1704). Collections search is collectionsV2. Mutations and subscriptions are rejected.",
       inputSchema: z.object({
         query: z.string().min(1),
         variables: z.record(z.string(), z.unknown()).default({}),
@@ -327,32 +373,81 @@ function buildServer(env: Env, ctx: ExecutionContext): McpServer {
   return server;
 }
 
-// ---------------------------------------------------------------- worker
+// ---------------------------------------------------------------- access
 
-/** Constant-time comparison so the path token can't be timed byte by byte. */
-function safeEqual(a: string, b: string): boolean {
-  const enc = new TextEncoder();
-  const x = enc.encode(a);
-  const y = enc.encode(b);
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-  return diff === 0;
+const ROUTE = "/mcp";
+
+/** Per-isolate JWKS cache (keys only; jose handles refresh/rotation). */
+const jwksByIssuer = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+
+function jwksFor(issuer: string) {
+  let jwks = jwksByIssuer.get(issuer);
+  if (!jwks) {
+    jwks = createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
+    jwksByIssuer.set(issuer, jwks);
+  }
+  return jwks;
 }
+
+function normalizeIssuer(teamDomain: string): string {
+  const d = teamDomain.trim().replace(/\/+$/, "");
+  return /^https?:\/\//.test(d) ? d : `https://${d}`;
+}
+
+function allowedEmails(env: Env): string[] {
+  return (env.ALLOWED_EMAILS ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * Verify the Cloudflare Access assertion: RS256 signature against the team's
+ * JWKS, plus iss, aud, exp, and the optional email allowlist.
+ * Returns the verified email, or null on any failure (never throws).
+ */
+async function verifyAccess(request: Request, env: Env): Promise<string | null> {
+  const token = request.headers.get("cf-access-jwt-assertion");
+  if (!token) return null;
+  const issuer = normalizeIssuer(env.ACCESS_TEAM_DOMAIN);
+  try {
+    const { payload } = await jwtVerify(token, jwksFor(issuer), {
+      issuer,
+      audience: env.ACCESS_AUD,
+      algorithms: ["RS256"],
+      requiredClaims: ["exp"],
+    });
+    const email = typeof payload.email === "string" ? payload.email.toLowerCase() : "";
+    const allow = allowedEmails(env);
+    if (allow.length && !allow.includes(email)) return null;
+    return email || String(payload.sub ?? "");
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------- worker
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (!env.PATH_TOKEN || env.PATH_TOKEN.length < 32 || !env.NEXUS_API_KEY) {
+    // 1. Fail closed on missing config.
+    if (!env.NEXUS_API_KEY || !env.MCP_HOSTNAME || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) {
       return new Response("Server not configured", { status: 500 });
     }
-    const { pathname } = new URL(request.url);
-    const m = pathname.match(/^\/mcp\/([^/]+)$/);
-    if (!m || !safeEqual(m[1], env.PATH_TOKEN)) {
+    // 2. Only one host, only one path.
+    const url = new URL(request.url);
+    if (url.hostname !== env.MCP_HOSTNAME || url.pathname !== ROUTE) {
       return new Response("Not found", { status: 404 });
     }
+    // 3. Verify the Access JWT ourselves; don't just trust the edge.
+    const user = await verifyAccess(request, env);
+    if (!user) return new Response("Forbidden", { status: 403 });
+
     const handler = createMcpHandler(() => buildServer(env, ctx), {
-      route: pathname,
+      route: ROUTE,
+      allowedHostnames: [env.MCP_HOSTNAME],
       corsOptions: false, // only server-to-server MCP clients; no browser access needed
+      authContext: { props: { user } },
     });
     return handler(request, env, ctx);
   },
